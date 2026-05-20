@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <sstream>
 
 #include "node.h"
 #include "tree.h"
@@ -522,6 +523,75 @@ void Reader::SetRpmFormat() {
     r.Check(archive_read_append_filter(a, ARCHIVE_FILTER_##s)); \
   }
 
+// Returns the command string for libarchive's filter_program to use for GPG decryption.
+//
+// On macOS, libarchive uses posix_spawnp with POSIX_SPAWN_CLOEXEC_DEFAULT and NULL envp.
+// Homebrew binaries (like gpg) invoked this way fail due to macOS process restrictions.
+// The workaround: write a small shell script and use that as the filter command instead.
+// /bin/sh is a platform binary exempt from those restrictions, and exec'ing gpg from it works.
+std::string MakeGpgFilterCommand() {
+  // Find gpg binary by searching PATH.
+  std::string gpg_path;
+  const char* path_env = getenv("PATH");
+  if (path_env) {
+    std::istringstream ss(path_env);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+      std::string candidate = dir + "/gpg";
+      if (access(candidate.c_str(), X_OK) == 0) {
+        gpg_path = std::move(candidate);
+        break;
+      }
+    }
+  }
+  if (gpg_path.empty()) {
+    return "gpg -d";
+  }
+
+  // Determine the GnuPG home directory.
+  std::string homedir;
+  const char* gnupghome = getenv("GNUPGHOME");
+  if (gnupghome && *gnupghome) {
+    homedir = gnupghome;
+  } else {
+    const char* home = getenv("HOME");
+    if (home && *home) {
+      homedir = std::string(home) + "/.gnupg";
+    }
+  }
+
+  std::string gpg_cmd = gpg_path;
+  if (!homedir.empty()) {
+    gpg_cmd += " --homedir " + homedir;
+  }
+  gpg_cmd += " -d";
+
+#if defined(__APPLE__)
+  // On macOS, libarchive spawns filter programs via posix_spawnp with NULL envp and
+  // POSIX_SPAWN_CLOEXEC_DEFAULT. Non-platform (Homebrew) binaries invoked this way
+  // fail to connect to gpg-agent. Running gpg through a shell script avoids this:
+  // /bin/sh is a platform binary exempt from those restrictions, and exec'ing gpg
+  // from within the script works correctly.
+  char tmpl[] = "/tmp/fuse_archive_gpg_XXXXXX.sh";
+  int fd = mkstemps(tmpl, 3);
+  if (fd >= 0) {
+    std::string script = "#!/bin/sh\nexec " + gpg_cmd + " 2>/dev/null\n";
+    write(fd, script.data(), script.size());
+    close(fd);
+    chmod(tmpl, 0700);
+    std::string script_path(tmpl);
+    // Unlink the script when the process exits; it only needs to exist while running.
+    static struct Cleanup {
+      std::string path;
+      ~Cleanup() { unlink(path.c_str()); }
+    } cleanup{script_path};
+    return script_path;
+  }
+#endif
+
+  return gpg_cmd;
+}
+
 #define SET_FILTER_COMMAND(s)                                 \
   [](Reader& r) {                                             \
     Archive* const a = r.archive.get();                       \
@@ -532,11 +602,16 @@ void Reader::SetRpmFormat() {
 #define WORK_AROUND_ISSUE_2514 ARCHIVE_VERSION_NUMBER < 3'009'000
 
 bool Reader::SetFilter(std::string_view const ext) {
+  static const std::string gpg_command = MakeGpgFilterCommand();
+  auto set_gpg_filter = [](Reader& r) {
+    Archive* const a = r.archive.get();
+    r.Check(archive_read_append_filter_program(a, gpg_command.c_str()));
+  };
   static std::unordered_map<std::string_view, void (*)(Reader&)> const
       ext_to_filter = {
-          {"asc", SET_FILTER_COMMAND(gpg)},
-          {"gpg", SET_FILTER_COMMAND(gpg)},
-          {"pgp", SET_FILTER_COMMAND(gpg)},
+          {"asc", set_gpg_filter},
+          {"gpg", set_gpg_filter},
+          {"pgp", set_gpg_filter},
           {"b64", SET_FILTER_COMMAND(base64)},
           {"base64", SET_FILTER_COMMAND(base64)},
           {"br", SET_FILTER_COMMAND(brotli)},
